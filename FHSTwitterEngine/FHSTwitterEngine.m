@@ -32,6 +32,7 @@
 #import <sys/socket.h>
 #import <netinet/in.h>
 #import <ifaddrs.h>
+#import <WebKit/WebKit.h>
 
 // Helper classes
 #include "FHSStream.h"
@@ -240,10 +241,10 @@ id removeNull(id rootObject) {
 
 @end
 
-@interface FHSTwitterEngineController : UIViewController <UIWebViewDelegate>
+@interface FHSTwitterEngineController : UIViewController <WKNavigationDelegate>
 
 @property (nonatomic, strong) UINavigationBar *navBar;
-@property (nonatomic, strong) UIWebView *theWebView;
+@property (nonatomic, strong) WKWebView *theWebView;
 @property (nonatomic, strong) UILabel *loadingText;
 @property (nonatomic, strong) UIActivityIndicatorView *spinner;
 @property (nonatomic, strong) FHSToken *requestToken;
@@ -2274,11 +2275,10 @@ id removeNull(id rootObject) {
     navItem.leftBarButtonItem = [[UIBarButtonItem alloc]initWithBarButtonSystemItem:UIBarButtonSystemItemCancel target:self action:@selector(close)];
     [_navBar pushNavigationItem:navItem animated:NO];
     
-    self.theWebView = [[UIWebView alloc]initWithFrame:CGRectMake(0, _navBar.bounds.size.height, self.view.bounds.size.width, self.view.bounds.size.height-_navBar.bounds.size.height)];
+    self.theWebView = [[WKWebView alloc]initWithFrame:CGRectMake(0, _navBar.bounds.size.height, self.view.bounds.size.width, self.view.bounds.size.height-_navBar.bounds.size.height)];
     _theWebView.hidden = YES;
-    _theWebView.delegate = self;
+    _theWebView.navigationDelegate = self;
     _theWebView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    _theWebView.dataDetectorTypes = UIDataDetectorTypeNone;
     _theWebView.scrollView.clipsToBounds = NO;
     _theWebView.backgroundColor = [UIColor lightGrayColor];
     [self.view addSubview:_theWebView];
@@ -2317,7 +2317,7 @@ id removeNull(id rootObject) {
                 
                 dispatch_sync(dispatch_get_main_queue(), ^{
                     @autoreleasepool {
-                        [_theWebView loadRequest:request];
+                        [self->_theWebView loadRequest:request];
                     }
                 });
             }
@@ -2355,47 +2355,56 @@ id removeNull(id rootObject) {
     [self gotPin:string];
 }
 
-- (NSString *)locatePin {
-    NSString *pin = [[_theWebView stringByEvaluatingJavaScriptFromString:newPinJS]stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    
-    if (pin.length == 7) {
-        return pin;
-    } else {
-        pin = [[_theWebView stringByEvaluatingJavaScriptFromString:oldPinJS]stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-        
+- (void)locatePin:(void(^)(NSString *pin))callback {
+    [_theWebView evaluateJavaScript:newPinJS completionHandler:^(id pinStr, NSError * _Nullable error) {
+        __block NSString *pin = pinStr;
         if (pin.length == 7) {
-            return pin;
+            callback(pin);
+        }else{
+            [self->_theWebView evaluateJavaScript:oldPinJS completionHandler:^(id oldPinStr, NSError * _Nullable error) {
+                if (oldPinStr != [NSNull null]){
+                    pin = oldPinStr;
+                    if(pin.length == 7) {
+                        callback(pin);
+                    }else{
+                        callback(@"");
+                    }
+                }else
+                    callback(@"");
+            }];
         }
-    }
-    return nil;
+    }];
 }
-
-- (void)webViewDidFinishLoad:(UIWebView *)webView {
+ 
+- (void)webView:(WKWebView *)webView didFinishNavigation:(null_unspecified WKNavigation *)navigation{
     _theWebView.userInteractionEnabled = YES;
-    NSString *authPin = [self locatePin];
-    
-    if (authPin.length > 0) {
-        [self gotPin:authPin];
-        return;
-    }
-    
-    NSString *formCount = [webView stringByEvaluatingJavaScriptFromString:@"document.forms.length"];
-    
-    if ([formCount isEqualToString:@"0"]) {
-        _navBar.topItem.title = @"Select and Copy the PIN";
-    }
-    
-    [UIView beginAnimations:nil context:nil];
-    _spinner.hidden = YES;
-    _loadingText.hidden = YES;
-    [UIView commitAnimations];
-    
-    [UIApplication sharedApplication].networkActivityIndicatorVisible = NO;
-    
-    _theWebView.hidden = NO;
+    [self locatePin:^(NSString *authPin) {
+        if (authPin.length > 0) {
+            [self gotPin:authPin];
+        }else{
+            [webView evaluateJavaScript:@"document.forms.length" completionHandler:^(id res, NSError * _Nullable error) {
+                if (res != [NSNull null]) {
+                    if (res != nil) {
+                        NSString *formCount = [NSString stringWithFormat:@"%@", res];
+                        if ([formCount isEqualToString:@"0"])
+                        self->_navBar.topItem.title = @"Select and Copy the PIN";
+                    }
+                }
+                
+                [UIView beginAnimations:nil context:nil];
+                self->_spinner.hidden = YES;
+                self->_loadingText.hidden = YES;
+                [UIView commitAnimations];
+                
+                [UIApplication sharedApplication].networkActivityIndicatorVisible = NO;
+                
+                self->_theWebView.hidden = NO;
+            }];
+        }
+    }];
 }
 
-- (void)webViewDidStartLoad:(UIWebView *)webView {
+- (void)webView:(WKWebView *)webView didStartProvisionalNavigation:(null_unspecified WKNavigation *)navigation{
     _theWebView.userInteractionEnabled = NO;
     [_theWebView setHidden:YES];
     _spinner.hidden = NO;
@@ -2403,22 +2412,25 @@ id removeNull(id rootObject) {
     [UIApplication sharedApplication].networkActivityIndicatorVisible = YES;
 }
 
-- (BOOL)webView:(UIWebView *)webView shouldStartLoadWithRequest:(NSURLRequest *)request navigationType:(UIWebViewNavigationType)navigationType {
-    
-    if (strstr([request.URL.absoluteString UTF8String], "denied=")) {
+
+- (void)webView:(WKWebView *)webView decidePolicyForNavigationAction:(WKNavigationAction *)navigationAction decisionHandler:(void (^)(WKNavigationActionPolicy))decisionHandler {
+    NSURL *URL = navigationAction.request.URL;
+    if (strstr([URL.absoluteString UTF8String], "denied=")) {
         [self dismissViewControllerAnimated:YES completion:nil];
-        return NO;
+        decisionHandler(WKNavigationActionPolicyCancel);
+        return;
     }
     
-    NSData *data = request.HTTPBody;
+    NSData *data = navigationAction.request.HTTPBody;
     char *raw = data?(char *)[data bytes]:"";
     
     if (raw && (strstr(raw, "cancel=") || strstr(raw, "deny="))) {
         [self close];
-        return NO;
+        decisionHandler(WKNavigationActionPolicyCancel);
+        return;
     }
     
-    return YES;
+    decisionHandler(WKNavigationActionPolicyAllow);
 }
 
 - (void)close {
